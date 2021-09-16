@@ -10,6 +10,10 @@ byte faceOffsetArray[] = { 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5 };
 
 // ----------------------------------------------------------------------------------------------------
 
+uint32_t randState = 0;
+
+// ----------------------------------------------------------------------------------------------------
+
 enum TileType : uint8_t
 {
   TileType_NotPresent,    // no neighbor present
@@ -108,7 +112,7 @@ enum Command : uint8_t
   Command_AssignTrack,
 
   Command_RequestTileInfo,      // one tile is asking another for its tile type+contents
-  Command_TileInfo,             // one tile is sendint its contents to another
+  Command_TileInfo,             // one tile is sending its contents to another
 
   Command_IngredientsInUse1,    // broadcast so all tiles know which ingredients are in use...
   Command_IngredientsInUse2,    // bitfield is 8-bits so need two packets
@@ -275,6 +279,13 @@ void processCommForFace(byte commandByte, byte value, byte f)
         }
       }
       break;
+
+    case Command_ServeCustomer:
+      if (tileInfo.tileType == TileType_Customer)
+      {
+        tileInfo.tileContentsValid = false;
+      }
+      break;
   }
 }
 
@@ -308,6 +319,9 @@ void processCommand_PingTrack(byte value, byte fromFace)
       enqueueCommOnFace(fromFace, Command_AssignTrack, 1);
       downstreamConveyorFace = fromFace;
       moveTimer.set(TRACK_MOVE_RATE);
+
+      // Seems like we're starting the game so init our random
+      randState = millis();
     }
   }
   else
@@ -348,6 +362,9 @@ void processCommand_AssignTrack(byte value, byte fromFace)
     return;
   }
 
+  // Seems like we're starting the game so init our random
+  randState = millis();
+
   // Every third conveyor tile has a plate, starting with the second tile
   // It is done this way so there aren't two plates next to one another when the loop completes
   tileInfo.tileType = (value == 1) ? TileType_ConveyorPlate : TileType_ConveyorEmpty;
@@ -387,6 +404,10 @@ void processCommand_TileInfo(byte value, byte fromFace)
   }
 
   tileInfoPacketsRemaining[fromFace]--;
+  if (tileInfoPacketsRemaining[fromFace] == 0)
+  {
+    neighborTileInfo[fromFace].tileContentsValid = true;
+  }
 }
 
 // ====================================================================================================
@@ -407,6 +428,31 @@ void broadcastIngredientsInUse()
 {
   broadcastToAllNeighbors(Command_IngredientsInUse1, ingredientsInUse & 0xF);
   broadcastToAllNeighbors(Command_IngredientsInUse2, (ingredientsInUse >> 4) & 0xF);
+}
+
+// ----------------------------------------------------------------------------------------------------
+
+// Random code partially copied from blinklib because there's no function
+// to set an explicit seed, which we need so we can share/replay puzzles.
+byte __attribute__((noinline)) randGetByte()
+{
+  // Algorithm "xor" from p. 4 of Marsaglia, "Xorshift RNGs"
+  uint32_t x = randState;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  randState = x;
+  return x & 0xFF;
+}
+
+// ----------------------------------------------------------------------------------------------------
+
+byte __attribute__((noinline)) randRange(byte min, byte max)
+{
+  uint32_t val = randGetByte();
+  uint32_t range = max - min;
+  val = (val * range) >> 8;
+  return val + min;
 }
 
 // ====================================================================================================
@@ -511,6 +557,7 @@ void loop_Unknown()
   {
     if (buttonDoubleClicked())
     {
+      randState = millis();
       tileInfo.tileType = TileType_Ingredient;
       tileInfo.tileContentsValid = false;
     }
@@ -569,6 +616,7 @@ void loop_Ingredient()
 
     if (buttonDoubleClicked())
     {
+      randState = millis();
       tileInfo.tileType = TileType_Customer;
       tileInfo.tileContentsValid = false;
     }
@@ -636,14 +684,114 @@ void loop_Customer()
 
     if (buttonDoubleClicked())
     {
+      randState = millis();
       tileInfo.tileType = TileType_Unknown;
     }
+  }
+  else if (tileInfo.tileContentsValid == false)
+  {
+    // Wait until a neighbor tells us what ingredients are already in use
+    // Valid bit == bit 0
+    // Make sure there is at least one ingredient being used
+    if (ingredientsInUse & 0x01)
+    {
+      byte numIngredientsInUse = 0;
+      for (byte i = IngredientType_MIN; i < IngredientType_MAX; i++)
+      {
+        if (ingredientsInUse & (1<<i))
+        {
+          numIngredientsInUse++;
+        }
+      }
+      
+      if (numIngredientsInUse >= 1)
+      {
+        tileInfo.tileContentsValid = true;
+        FOREACH_FACE(f)
+        {
+          tileInfo.tileContents[f] = IngredientType_Empty;
+        }
+        
+        // Create an order based on the available ingredients
+        byte numIngredientsInOrder = randRange(1, 4);
+        for (byte ingredientNum = 0; ingredientNum < numIngredientsInOrder; ingredientNum++)
+        {
+          // Get a random ingredient
+          byte ingredientsToSkip = randRange(0, numIngredientsInUse);
+          for (byte i = IngredientType_MIN; i < IngredientType_MAX; i++)
+          {
+            if (ingredientsInUse & (1<<i))
+            {
+              if (ingredientsToSkip == 0)
+              {
+                // Use this ingredient
+                byte firstFace = randRange(0, FACE_COUNT);
+                byte pattern = ingredientInfo[i].pattern;
+                FOREACH_FACE(f)
+                {
+                  if (pattern & 0x1)
+                  {
+                    byte face = CW_FROM_FACE(firstFace, f);
+                    tileInfo.tileContents[face] = (IngredientType) i;
+                  }
+                  pattern >>= 1;
+                }
+                break;
+              }
+              else
+              {
+                ingredientsToSkip--;
+              }
+            }
+          }
+        }
+
+        // Tell all our attached conveyor neighbors about our contents
+        FOREACH_FACE(f)
+        {
+          // Must send all the info back-to-back as that is what the receiver will expect
+          enqueueCommOnFace(f, Command_TileInfo, tileInfo.tileType);
+          // Order doesn't matter since matching is rotation-agnostic
+          enqueueCommOnFace(f, tileInfo.tileContents[0], tileInfo.tileContents[1]);
+          enqueueCommOnFace(f, tileInfo.tileContents[2], tileInfo.tileContents[3]);
+          enqueueCommOnFace(f, tileInfo.tileContents[4], tileInfo.tileContents[5]);
+        }
+
+      }
+    }
+  }
+  else
+  {
+    // Normal gameplay
   }
 }
 
 // ----------------------------------------------------------------------------------------------------
 
 void loop_Conveyor()
+{
+  conveyor_Move();
+
+  if (buttonSingleClicked())
+  {
+    // Rotate the plate
+    IngredientType contentSave = tileInfo.tileContents[0];
+    for (byte f = 0; f <= 4; f++)
+    {
+      tileInfo.tileContents[f] = tileInfo.tileContents[f+1];
+    }
+    tileInfo.tileContents[5] = contentSave;
+  }
+
+  if (tileInfo.tileType == TileType_ConveyorPlate)
+  {
+    conveyor_AttemptOrderMatch();
+  }
+}
+
+// ----------------------------------------------------------------------------------------------------
+
+void conveyor_Move()
 {
   if (!moveTimer.isExpired())
   {
@@ -720,9 +868,6 @@ void loop_Conveyor()
       tileInfo.tileContents[f] = neighborTileInfo[upstreamConveyorFace].tileContents[f];
     }
 
-    // Send upstream neighbor a message so they know to clear their contents
-    //enqueueCommOnFace(upstreamConveyorFace, Command_TookContents, DONT_CARE);
-
     // Get ready for the next move
     requestedUpstreamTileInfo = false;
     receivedUpstreamTileInfo = false;
@@ -732,8 +877,58 @@ void loop_Conveyor()
     // Invalidate our view of the upstream tile since we just took it
     neighborTileInfo[upstreamConveyorFace].tileType = TileType_Unknown;
     neighborTileInfo[upstreamConveyorFace].tileContentsValid = false;
+  }
+}
 
-    //doneOneMove = true;
+// ----------------------------------------------------------------------------------------------------
+
+void conveyor_AttemptOrderMatch()
+{
+  // Check if the contents of our plate matches an adjacent customer order
+  FOREACH_FACE(f)
+  {
+    if (neighborTileInfo[f].tileType != TileType_Customer)
+    {
+      continue;
+    }
+
+    if (!tileInfo.tileContentsValid || !neighborTileInfo[f].tileContentsValid)
+    {
+      continue;
+    }
+
+    // Allow match at any rotation - I'm not cruel
+    FOREACH_FACE(matchRotation)
+    {
+      // Start out assuming a match
+      // Prove me wrong, kids. Prove me wrong.
+      bool matched = true;
+      FOREACH_FACE(matchFace)
+      {
+        byte orderFace = CW_FROM_FACE(matchFace, matchRotation);
+        if (tileInfo.tileContents[matchFace] != neighborTileInfo[f].tileContents[orderFace])
+        {
+          matched = false;
+          break;
+        }
+      }
+
+      // If we matched then clear the plate and the customer
+      if (matched)
+      {
+        // Clear the plate!
+        clearTileContents(tileInfo.tileContents);
+
+        // Clear our knowledge of the customer's order
+        neighborTileInfo[f].tileContentsValid = false;
+
+        // Tell the customer to clear their order (and get a new one)
+        enqueueCommOnFace(f, Command_ServeCustomer, DONT_CARE);
+
+        // Break out - plate can only be served once
+        break;
+      }
+    }
   }
 }
 
@@ -815,7 +1010,21 @@ void render()
       break;
 
     case TileType_Customer:
-      setColorOnFace(makeColorRGB(128, 0, 128), 0);
+      if (tileInfo.tileContentsValid)
+      {
+        FOREACH_FACE(f)
+        {
+          if (tileInfo.tileContents[f] != IngredientType_Empty)
+          {
+            color.as_uint16 = ingredientInfo[tileInfo.tileContents[f]].color;
+            setColorOnFace(color, f);
+          }
+        }
+      }
+      else
+      {
+        setColorOnFace(makeColorRGB(128, 0, 128), 0);
+      }
       break;
   }
 
