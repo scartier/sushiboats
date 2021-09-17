@@ -1041,12 +1041,4 @@ void render()
       setColorOnFace(MAGENTA, f);
     }
   }
-
-/*
-    if (moveTimerExpired_latch) setColorOnFace(WHITE, 0);
-    if (requestedUpstreamTileInfo_latch) setColorOnFace(WHITE, 1);
-    if (receivedUpstreamTileInfo_latch) setColorOnFace(WHITE, 2);
-    if (downstreamRequestedTileInfo_latch) setColorOnFace(WHITE, 3);
-    if (sentDownstreamTileInfo_latch) setColorOnFace(WHITE, 4);
-    */
 }
