@@ -10,7 +10,7 @@ byte faceOffsetArray[] = { 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5 };
 
 // ----------------------------------------------------------------------------------------------------
 
-uint32_t randState = 0;
+uint32_t randState = 123;
 
 // ----------------------------------------------------------------------------------------------------
 
@@ -66,6 +66,7 @@ byte newIngredientsInUse;     // used when updating from a neighbor
 
 // ----------------------------------------------------------------------------------------------------
 
+// Used by conveyor tiles to track which face is connected to other conveyor tiles
 byte downstreamConveyorFace = 0;
 byte upstreamConveyorFace = 0;
 
@@ -81,9 +82,11 @@ TileInfo neighborTileInfo[FACE_COUNT];
 byte neighborFaceOffset[FACE_COUNT];
 
 byte neighborCount = 0;
+bool hasAdjacentNeighbors = 0;
 bool trackError = false;
 byte waitingForPing = 0;
 bool pingError = false;
+byte conveyorFace;              // Face of attached conveyor (for ingredient tiles)
 
 #define PULSE_RATE 500
 Timer pulseTimer;
@@ -96,13 +99,6 @@ bool requestedUpstreamTileInfo = false;
 bool receivedUpstreamTileInfo = false;
 bool downstreamRequestedTileInfo = false;
 bool sentDownstreamTileInfo = false;
-bool doneOneMove = false;
-
-bool moveTimerExpired_latch = false;
-bool requestedUpstreamTileInfo_latch = false;
-bool receivedUpstreamTileInfo_latch = false;
-bool downstreamRequestedTileInfo_latch = false;
-bool sentDownstreamTileInfo_latch = false;
 
 // ----------------------------------------------------------------------------------------------------
 
@@ -139,7 +135,6 @@ void reset()
 {
   // Reset our tile state
   tileInfo.tileType = TileType_Unknown;
-  //clearTileContents(tileInfo.tileContents);
   tileInfo.tileContentsValid = false;
 
   // Reset our view of our neighbor tiles
@@ -157,12 +152,10 @@ void broadcastToAllNeighbors(byte command, byte value)
 {
   FOREACH_FACE(f)
   {
-    if (isValueReceivedOnFaceExpired(f))
+    if (!isValueReceivedOnFaceExpired(f))
     {
-      continue;
+      enqueueCommOnFace(f, command, value);
     }
-
-    enqueueCommOnFace(f, command, value);
   }
 }
 
@@ -171,8 +164,6 @@ void broadcastToAllNeighbors(byte command, byte value)
 void processCommForFace(byte commandByte, byte value, byte f)
 {
   byte face;
-
-  //pulseTimer.set(PULSE_RATE);
 
   // Use the comm system in a non-standard way to send multiple values for a command
   if (tileInfoPacketsRemaining[f] > 0)
@@ -187,7 +178,6 @@ void processCommForFace(byte commandByte, byte value, byte f)
       {
         // Got all the tile info - we're ready to switch when our neighbors are
         receivedUpstreamTileInfo = true;
-        receivedUpstreamTileInfo_latch = true;
       }
     }
     return;
@@ -211,7 +201,6 @@ void processCommForFace(byte commandByte, byte value, byte f)
         // Downstream neighbor is ready to accept our contents
         // We will send when we are also ready to move (might be immediately)
         downstreamRequestedTileInfo = true;
-        downstreamRequestedTileInfo_latch = true;
       }
       break;
 
@@ -223,6 +212,7 @@ void processCommForFace(byte commandByte, byte value, byte f)
       break;
 
     case Command_IngredientsInUse1:
+      conveyorFace = f;   // save the face we got this from in case we are an ingredient tile
       newIngredientsInUse = value;
       break;
 
@@ -263,6 +253,8 @@ void processCommForFace(byte commandByte, byte value, byte f)
       break;
 
     case Command_AddIngredientToPlate:
+      // Received from an ingredient tile when the player clicks the button
+      // The ingredient is added to all adjacent plates
       if (tileInfo.tileType == TileType_ConveyorPlate &&
           neighborTileInfo[f].tileType == TileType_Ingredient &&
           neighborTileInfo[f].tileContentsValid)
@@ -281,8 +273,16 @@ void processCommForFace(byte commandByte, byte value, byte f)
       break;
 
     case Command_ServeCustomer:
+      // Sent from a plate tile to a customer tile when the customer's
+      // order is served. Forces the customer to invalidate their
+      // current order, which will cause them to generate a new one.
       if (tileInfo.tileType == TileType_Customer)
       {
+        if (tileInfo.tileContentsValid)
+        {
+          // TODO : Some animation showing the order going away
+        }
+
         tileInfo.tileContentsValid = false;
       }
       break;
@@ -295,11 +295,9 @@ void processCommand_PingTrack(byte value, byte fromFace)
 {
   pulseTimer.set(PULSE_RATE);
 
-  pingError = false;
-  if (value)
-  {
-    pingError = true;
-  }
+  // Start by taking the error value from the sender
+  // If there is an error on *this* tile then we will set this
+  pingError = value;
 
   // If we were the originator then consume the ping
   if (waitingForPing > 0)
@@ -307,7 +305,7 @@ void processCommand_PingTrack(byte value, byte fromFace)
     // We were the originator of the ping - consume it
     waitingForPing--;
 
-    // If we got both pings, and they were clean then we can start
+    // If we got both pings, and they were clean, then we can start
     // assigning tile roles around the track
     if (waitingForPing == 0 && pingError == false)
     {
@@ -316,28 +314,25 @@ void processCommand_PingTrack(byte value, byte fromFace)
       tileInfo.tileContentsValid = true;
       clearTileContents(tileInfo.tileContents);
 
-      enqueueCommOnFace(fromFace, Command_AssignTrack, 1);
+      enqueueCommOnFace(fromFace, Command_AssignTrack, 1);  // 1 = plate
       downstreamConveyorFace = fromFace;
       moveTimer.set(TRACK_MOVE_RATE);
-
-      // Seems like we're starting the game so init our random
-      randState = millis();
     }
   }
-  else
+  else  // (waitingForPing > 0)
   {
-    // Neighbor is checking for a valid track
+    // Someone in the track is checking if it's valid
     if (trackError)
     {
-      if (value == 0)
+      if (!pingError)
       {
-        // If we have a new error then send it back
+        // If we have a new error then send it back from whence it came
         enqueueCommOnFace(fromFace, Command_PingTrack, 1);
       }
     }
     else
     {
-      // No error - continue the ping to the next tile along the track
+      // No error on this tile - propagate the ping to the next tile along the track
       FOREACH_FACE(f)
       {
         if (f != fromFace)
@@ -362,11 +357,10 @@ void processCommand_AssignTrack(byte value, byte fromFace)
     return;
   }
 
-  // Seems like we're starting the game so init our random
-  randState = millis();
-
-  // Every third conveyor tile has a plate, starting with the second tile
-  // It is done this way so there aren't two plates next to one another when the loop completes
+  // Every third conveyor tile has a plate, starting with the second tile.
+  // It is done this way so there aren't two plates next to one another anywhere in the loop.
+  // If we started with a plate then we might also end with a plate and thus
+  // have two plates next to one another.
   tileInfo.tileType = (value == 1) ? TileType_ConveyorPlate : TileType_ConveyorEmpty;
   tileInfo.tileContentsValid = true;
   clearTileContents(tileInfo.tileContents);
@@ -426,14 +420,14 @@ void clearTileContents(IngredientType *tileContents)
 
 void broadcastIngredientsInUse()
 {
-  broadcastToAllNeighbors(Command_IngredientsInUse1, ingredientsInUse & 0xF);
+  broadcastToAllNeighbors(Command_IngredientsInUse1, ingredientsInUse & 0xE);   // don't send valid bit[0]
   broadcastToAllNeighbors(Command_IngredientsInUse2, (ingredientsInUse >> 4) & 0xF);
 }
 
 // ----------------------------------------------------------------------------------------------------
 
 // Random code partially copied from blinklib because there's no function
-// to set an explicit seed, which we need so we can share/replay puzzles.
+// to set an explicit seed.
 byte __attribute__((noinline)) randGetByte()
 {
   // Algorithm "xor" from p. 4 of Marsaglia, "Xorshift RNGs"
@@ -449,10 +443,10 @@ byte __attribute__((noinline)) randGetByte()
 
 byte __attribute__((noinline)) randRange(byte min, byte max)
 {
-  uint32_t val = randGetByte();
-  uint32_t range = max - min;
-  val = (val * range) >> 8;
-  return val + min;
+  byte val = randGetByte();
+  byte range = max - min;
+  uint16_t mult = val * range;
+  return min + (mult >> 8);
 }
 
 // ====================================================================================================
@@ -495,34 +489,42 @@ void detectNeighbors()
 {
   // Detect all neighbors, taking optional action on neighbors added/removed
   neighborCount = 0;
+  hasAdjacentNeighbors = false;
+  bool prevFaceHasNeighbor = !isValueReceivedOnFaceExpired(5);
   FOREACH_FACE(f)
   {
     if (isValueReceivedOnFaceExpired(f))
     {
       // No neighbor
       
-      // Reset the tile info packet count in case it was in the middle 
+      // Reset the tile info packet count in case it was in the middle of receiving
       tileInfoPacketsRemaining[f] = 0;
       
-      // Was there was one previously?
-      if (neighborTileInfo[f].tileType != TileType_NotPresent)
+      // If there was an ingredient then remove it from the ones in use
+      if (neighborTileInfo[f].tileType == TileType_Ingredient && neighborTileInfo[f].tileContentsValid)
       {
         if (tileInfo.tileType == TileType_ConveyorEmpty || tileInfo.tileType == TileType_ConveyorPlate)
         {
           // Remove ingredients from the list of used
-          if (neighborTileInfo[f].tileType == TileType_Ingredient && neighborTileInfo[f].tileContentsValid)
-          {
-            ingredientsInUse &= ~(1<<neighborTileInfo[f].tileContents[0]);
-            broadcastIngredientsInUse();
-          }
+          ingredientsInUse &= ~(1<<neighborTileInfo[f].tileContents[0]);
+          broadcastIngredientsInUse();
         }
-
-        neighborTileInfo[f].tileType = TileType_NotPresent;
       }
+
+      neighborTileInfo[f].tileType = TileType_NotPresent;
+
+      prevFaceHasNeighbor = false;
     }
     else
     {
       // Neighbor present
+
+      // Set a flag when two neighbors are adjacent
+      // This is used to determine track errors later
+      if (prevFaceHasNeighbor)
+      {
+        hasAdjacentNeighbors = true;
+      }
 
       // Is this a new neighbor?
       if (neighborTileInfo[f].tileType == TileType_NotPresent)
@@ -535,14 +537,17 @@ void detectNeighbors()
           // Send the list of ingredients in use
           // Ingredient tiles will use this to select a non-repeat (Command_IngredientUsed).
           // Customer tiles will use this to generate an order and send it to us (Command_TileInfo).
-          enqueueCommOnFace(f, Command_IngredientsInUse1, ingredientsInUse & 0xF);
+          enqueueCommOnFace(f, Command_IngredientsInUse1, ingredientsInUse & 0xE);
           enqueueCommOnFace(f, Command_IngredientsInUse2, (ingredientsInUse >> 4) & 0xF);
         }
       }
       neighborCount++;
+
+      prevFaceHasNeighbor = true;
     }
   }
 
+  // When not next to any other tiles, clear the valid bit in our ingredients
   if (neighborCount == 0)
   {
     ingredientsInUse = 0;
@@ -571,6 +576,12 @@ void loop_Unknown()
       trackError = true;
     }
 
+    if (hasAdjacentNeighbors)
+    {
+      trackError = true;
+    }
+
+    /*
     // Check if two neighbors are adjacent
     FOREACH_FACE(f)
     {
@@ -583,6 +594,7 @@ void loop_Unknown()
         trackError = true;
       }
     }
+    */
 
     // Double click sends a pulse around the track, checking for any errors
     if (buttonDoubleClicked())
@@ -593,13 +605,10 @@ void loop_Unknown()
         pingError = false;
         pulseTimer.set(PULSE_RATE);
 
+        waitingForPing += 2;
         FOREACH_FACE(f)
         {
-          if (neighborTileInfo[f].tileType != TileType_NotPresent)
-          {
-            waitingForPing++;
-            enqueueCommOnFace(f, Command_PingTrack, 0);
-          }
+          enqueueCommOnFace(f, Command_PingTrack, 0);
         }
       }
     }
@@ -616,7 +625,6 @@ void loop_Ingredient()
 
     if (buttonDoubleClicked())
     {
-      randState = millis();
       tileInfo.tileType = TileType_Customer;
       tileInfo.tileContentsValid = false;
     }
@@ -644,19 +652,18 @@ void loop_Ingredient()
         {
           // Found the first unused ingredient - take it
           tileInfo.tileContentsValid = true;
-          clearTileContents(tileInfo.tileContents);
           tileInfo.tileContents[0] = (IngredientType) newIngredientIndex;
 
-          // Broadcast our choice so all the other tiles know
-          // Conveyor tiles will merge it into the ingredientsInUse bitfield, and send it around the loop
-          FOREACH_FACE(f)
-          {
-            if (!isValueReceivedOnFaceExpired(f))
-            {
-              enqueueCommOnFace(f, Command_IngredientSelected, newIngredientIndex);
-              enqueueCommOnFace(f, Command_FaceIndex, f);
-            }
-          }
+          // Tell an adjacent conveyor tile our choice so it can merge it into the
+          // the ingredientsInUse bitfield and propagate it everywhere.
+          // We know this is the face of a conveyor because it previously told us
+          // the original newIngredientsInUse.
+          enqueueCommOnFace(conveyorFace, Command_IngredientSelected, newIngredientIndex);
+
+          // Also tell it the face we're using to communicate so it can get relative rotations correct
+          enqueueCommOnFace(conveyorFace, Command_FaceIndex, conveyorFace);
+
+          // Got the ingredient - nothing else to do
           break;
         }
       }
@@ -684,7 +691,6 @@ void loop_Customer()
 
     if (buttonDoubleClicked())
     {
-      randState = millis();
       tileInfo.tileType = TileType_Unknown;
     }
   }
@@ -692,9 +698,9 @@ void loop_Customer()
   {
     // Wait until a neighbor tells us what ingredients are already in use
     // Valid bit == bit 0
-    // Make sure there is at least one ingredient being used
     if (ingredientsInUse & 0x01)
     {
+      // Count the number of ingredients available around the track
       byte numIngredientsInUse = 0;
       for (byte i = IngredientType_MIN; i < IngredientType_MAX; i++)
       {
@@ -704,27 +710,35 @@ void loop_Customer()
         }
       }
       
+      // Make sure there is at least one ingredient being used
       if (numIngredientsInUse >= 1)
       {
         tileInfo.tileContentsValid = true;
-        FOREACH_FACE(f)
-        {
-          tileInfo.tileContents[f] = IngredientType_Empty;
-        }
+
+        // Start the order empty
+        clearTileContents(tileInfo.tileContents);
         
         // Create an order based on the available ingredients
-        byte numIngredientsInOrder = randRange(1, 4);
+        byte numIngredientsInOrder = randRange(2, 4);
         for (byte ingredientNum = 0; ingredientNum < numIngredientsInOrder; ingredientNum++)
         {
           // Get a random ingredient
           byte ingredientsToSkip = randRange(0, numIngredientsInUse);
           for (byte i = IngredientType_MIN; i < IngredientType_MAX; i++)
           {
+            // Find an ingredient in use
             if (ingredientsInUse & (1<<i))
             {
-              if (ingredientsToSkip == 0)
+              // Keep going until we get to our randomly-selected ingredient
+              if (ingredientsToSkip > 0)
+              {
+                ingredientsToSkip--;
+              }
+              else
               {
                 // Use this ingredient
+
+                // Rotate it randomly
                 byte firstFace = randRange(0, FACE_COUNT);
                 byte pattern = ingredientInfo[i].pattern;
                 FOREACH_FACE(f)
@@ -738,20 +752,17 @@ void loop_Customer()
                 }
                 break;
               }
-              else
-              {
-                ingredientsToSkip--;
-              }
             }
           }
         }
 
+        // Finished constructing the order
         // Tell all our attached conveyor neighbors about our contents
         FOREACH_FACE(f)
         {
           // Must send all the info back-to-back as that is what the receiver will expect
           enqueueCommOnFace(f, Command_TileInfo, tileInfo.tileType);
-          // Order doesn't matter since matching is rotation-agnostic
+          // Doesn't matter what face we start with since matching is rotation-agnostic
           enqueueCommOnFace(f, tileInfo.tileContents[0], tileInfo.tileContents[1]);
           enqueueCommOnFace(f, tileInfo.tileContents[2], tileInfo.tileContents[3]);
           enqueueCommOnFace(f, tileInfo.tileContents[4], tileInfo.tileContents[5]);
@@ -772,6 +783,15 @@ void loop_Conveyor()
 {
   conveyor_Move();
 
+  // Early out if this isn't a plate tile
+  if (tileInfo.tileType != TileType_ConveyorPlate)
+  {
+    return;
+  }
+
+  // Check if this plate matches any adjacent customer orders
+  conveyor_AttemptOrderMatch();
+
   if (buttonSingleClicked())
   {
     // Rotate the plate
@@ -781,11 +801,6 @@ void loop_Conveyor()
       tileInfo.tileContents[f] = tileInfo.tileContents[f+1];
     }
     tileInfo.tileContents[5] = contentSave;
-  }
-
-  if (tileInfo.tileType == TileType_ConveyorPlate)
-  {
-    conveyor_AttemptOrderMatch();
   }
 }
 
@@ -798,8 +813,6 @@ void conveyor_Move()
     return;
   }
 
-  moveTimerExpired_latch = true;
-
   // Move timer has expired
   // Start the process to move contents along the track
 
@@ -808,25 +821,25 @@ void conveyor_Move()
   //
   // THIS, UP, DOWN :
   //    THIS requests tile info from UP
-  //    UP sends tile info to UP - THIS saves in neighborTileInfo
+  //    UP sends tile info to THIS - THIS saves in neighborTileInfo
   //    DOWN requests tile info from THIS - THIS sends tile info to DOWN - SWITCH
   // UP, THIS, DOWN :
-  //    THIS requests tile info from UP - UP sends tile info to UP - THIS saves in neighborTileInfo
+  //    THIS requests tile info from UP - UP sends tile info to THIS - THIS saves in neighborTileInfo
   //    DOWN requests tile info from THIS - THIS sends tile info to DOWN - SWITCH
   // THIS, DOWN, UP :
   //    THIS requests tile info from UP
   //    DOWN requests tile info from THIS - THIS sends tile info to DOWN
-  //    UP sends tile info to UP - THIS saves in neighborTileInfo - SWITCH
+  //    UP sends tile info to THIS - THIS saves in neighborTileInfo - SWITCH
   // DOWN, THIS, UP :
   //    DOWN requests tile info from THIS
   //    THIS requests tile info from UP - THIS sends tile info to DOWN
-  //    UP sends tile info to UP - THIS saves in neighborTileInfo - SWITCH
+  //    UP sends tile info to THIS - THIS saves in neighborTileInfo - SWITCH
   // DOWN, UP, THIS :
   //    DOWN requests tile info from THIS
-  //    THIS requests tile info from UP - THIS sends tile info to DOWN - UP sends tile info to UP - THIS saves in neighborTileInfo - SWITCH
+  //    THIS requests tile info from UP - THIS sends tile info to DOWN - UP sends tile info to THIS - THIS saves in neighborTileInfo - SWITCH
   // UP, DOWN, THIS :
   //    DOWN requests tile info from THIS
-  //    THIS requests tile info from UP - THIS sends tile info to DOWN - UP sends tile info to UP - THIS saves in neighborTileInfo - SWITCH
+  //    THIS requests tile info from UP - THIS sends tile info to DOWN - UP sends tile info to THIS - THIS saves in neighborTileInfo - SWITCH
 
   // If the downstream neighbor has requested our contents then send that now
   if (downstreamRequestedTileInfo && !sentDownstreamTileInfo && commInsertionIndexes[downstreamConveyorFace] == 0)
@@ -835,18 +848,12 @@ void conveyor_Move()
     enqueueCommOnFace(downstreamConveyorFace, Command_TileInfo, tileInfo.tileType);
     // Start with the contents on the face that will receive the packet
     // ex. Sending to face 2 means starting with face 5 content and proceeding clockwise
-    byte contentIndex1 = OPPOSITE_FACE(downstreamConveyorFace);
-    byte contentIndex2 = CW_FROM_FACE(contentIndex1, 1);
-    enqueueCommOnFace(downstreamConveyorFace, tileInfo.tileContents[contentIndex1], tileInfo.tileContents[contentIndex2]);
-    contentIndex1 = CW_FROM_FACE(contentIndex2, 1);
-    contentIndex2 = CW_FROM_FACE(contentIndex1, 1);
-    enqueueCommOnFace(downstreamConveyorFace, tileInfo.tileContents[contentIndex1], tileInfo.tileContents[contentIndex2]);
-    contentIndex1 = CW_FROM_FACE(contentIndex2, 1);
-    contentIndex2 = CW_FROM_FACE(contentIndex1, 1);
-    enqueueCommOnFace(downstreamConveyorFace, tileInfo.tileContents[contentIndex1], tileInfo.tileContents[contentIndex2]);
+    byte *startingFace = &faceOffsetArray[OPPOSITE_FACE(downstreamConveyorFace)];
+    enqueueCommOnFace(downstreamConveyorFace, tileInfo.tileContents[startingFace[0]], tileInfo.tileContents[startingFace[1]]);
+    enqueueCommOnFace(downstreamConveyorFace, tileInfo.tileContents[startingFace[2]], tileInfo.tileContents[startingFace[3]]);
+    enqueueCommOnFace(downstreamConveyorFace, tileInfo.tileContents[startingFace[4]], tileInfo.tileContents[startingFace[5]]);
 
     sentDownstreamTileInfo = true;
-    sentDownstreamTileInfo_latch = true;
   }
 
   // If this is our first loop being ready then request our upstream neighbor's tile info
@@ -855,11 +862,10 @@ void conveyor_Move()
   {
     enqueueCommOnFace(upstreamConveyorFace, Command_RequestTileInfo, DONT_CARE);
     requestedUpstreamTileInfo = true;
-    requestedUpstreamTileInfo_latch = true;
   }
   
-  // If we received the upstream tile info and sent ours along to the downstream tile then make the switch
-  if (!doneOneMove && receivedUpstreamTileInfo && sentDownstreamTileInfo)
+  // If we received the upstream tile info AND sent ours along to the downstream tile then make the switch
+  if (receivedUpstreamTileInfo && sentDownstreamTileInfo)
   {
     // Copy and invalidate the upstream neighbor's tile info
     tileInfo.tileType = neighborTileInfo[upstreamConveyorFace].tileType;
