@@ -257,7 +257,8 @@ void processCommForFace(byte commandByte, byte value, byte f)
       // The ingredient is added to all adjacent plates
       if (tileInfo.tileType == TileType_ConveyorPlate &&
           neighborTileInfo[f].tileType == TileType_Ingredient &&
-          neighborTileInfo[f].tileContentsValid)
+          neighborTileInfo[f].tileContentsValid &&
+          !sentDownstreamTileInfo)
       {
         IngredientType ingredientIndex = neighborTileInfo[f].tileContents[0];
         byte pattern = ingredientInfo[ingredientIndex].pattern;
@@ -802,6 +803,14 @@ void loop_Conveyor()
     }
     tileInfo.tileContents[5] = contentSave;
   }
+  else if (buttonDoubleClicked())
+  {
+    // Clear the plate
+    FOREACH_FACE(f)
+    {
+      tileInfo.tileContents[f] = IngredientType_Empty;
+    }
+  }
 }
 
 // ----------------------------------------------------------------------------------------------------
@@ -878,6 +887,7 @@ void conveyor_Move()
     requestedUpstreamTileInfo = false;
     receivedUpstreamTileInfo = false;
     sentDownstreamTileInfo = false;
+    downstreamRequestedTileInfo = false;
     moveTimer.set(TRACK_MOVE_RATE);
 
     // Invalidate our view of the upstream tile since we just took it
